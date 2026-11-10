@@ -75,7 +75,7 @@ class EngineConfigV4:
     REF_SHARES_B = 12.70          # [2026-11-08] 统一到 12.7，与 ASSUMED_SHARES_B/HEDGE_RATIO 同锚
     
     # 核心利差门禁
-    ENTRY_SPREAD_BPS = 750.0            # 开仓利差门槛 (当前约为 830 bps)
+    ENTRY_SPREAD_BPS = 550.0            # [2026-11-11] 开仓利差门槛 (从750下调以适应路演启动后的spread收窄)
     # [2026-11-11] EXIT_SWING_PROFIT_BPS 已删除: 7天 S 最低 13.22B=520bps, 从未触发
     # [2026-11-11] EXIT_TERMINAL_CONVERGE_BPS 已删除: 统一由 ROI 管理出场
     
@@ -844,7 +844,7 @@ class AtomicDualLegEngineV4:
         """[2026-11-09] 补偿腿：只补「缺的那条腿」，把两腿拉回美元中性。
 
         与「开仓」的本质区别：本方法只允许 **减小** |net_delta|，绝不新增净敞口。
-        触发前置条件（调用方保证）：价差 >= ENTRY_SPREAD_BPS、非 quota 熔断。
+        触发前置条件（调用方保证）：价差 >= ENTRY_SPREAD_BPS(550)、非 quota 熔断。
         返回 True 表示本轮发出了一笔补腿单。
         """
         now = time.time()
