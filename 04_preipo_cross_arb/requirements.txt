@@ -1,0 +1,6 @@
+# tree-twin 双腿对冲线依赖（main 的做市线依赖不同，见该分支）
+websockets>=12.0
+hyperliquid-python-sdk>=0.9.0
+eth-account>=0.11.0
+okx>=2.1.2          # 可选：仅当不使用 shared/gateway_okx_client.py 的裸 REST 实现时
+pytest>=8.0         # 仅测试
