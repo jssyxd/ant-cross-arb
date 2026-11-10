@@ -76,8 +76,8 @@ class EngineConfigV4:
     
     # 核心利差门禁
     ENTRY_SPREAD_BPS = 750.0            # 开仓利差门槛 (当前约为 830 bps)
-    EXIT_SWING_PROFIT_BPS = 500.0       # 波段止盈平仓线 (从 800+ 回落至 <= 500 bps 时锁定 250+ bps 波动差价)
-    EXIT_TERMINAL_CONVERGE_BPS = 50.0   # 终极规则收敛平仓线 (S-1 修正案或上市抹平利差)
+    # [2026-11-11] EXIT_SWING_PROFIT_BPS 已删除: 7天 S 最低 13.22B=520bps, 从未触发
+    # [2026-11-11] EXIT_TERMINAL_CONVERGE_BPS 已删除: 统一由 ROI 管理出场
     
     # 收益与风控红线
     TARGET_NET_ROI_PCT = 8.0            # 双腿占用保证金净收益率 >= 8.0% 立即止盈双平 (4h 价差 sigma 约 7.6% of margin, 门槛需高于 1 sigma)
@@ -691,6 +691,22 @@ class AtomicDualLegEngineV4:
             logger.warning(f"⚠️ [盘口预检] OKX 卖一获取失败: {e}")
         return None
 
+    def _close_hl_market_force(self, q_hl: float) -> Tuple[bool, float, float]:
+        hl_mid = (self.state.hl_ask_px + self.state.hl_bid_px) / 2.0 if self.state.hl_ask_px > 0 else 0
+        if hl_mid <= 0: return False, 0.0, 0.0
+        notional = q_hl * hl_mid
+        if notional > self.cfg.MIN_ORDER_USD * 1.5:
+            return False, 0.0, 0.0
+        logger.warning(f"⚡ [residue detect] HL ${notional:.2f} < ${self.cfg.MIN_ORDER_USD*1.5:.2f} -> market flush")
+        try:
+            res = self.hl_exchange.market_close(self.cfg.HL_SYMBOL, sz=round(q_hl,2), slippage=0.01)
+            filled, px = self._parse_hl_fill(res)
+            logger.warning(f"⚡ [residue clear] HL market close {filled:.2f}/{q_hl:.2f} @ ${px:.4f}")
+            return True, filled, px
+        except Exception as e:
+            logger.error(f"residue clear fail: {e}")
+            return False, 0.0, 0.0
+
     def _close_hl_depth_aware(self, q_hl: float, tag: str = "平仓", allow_market: bool = True) -> Tuple[bool, float, float]:
         """
         盘口预检 + 动态拆单平掉 HL 仓位 (多头或空头)。
@@ -741,8 +757,9 @@ class AtomicDualLegEngineV4:
                     logger.warning(f"🛑 [{tag}] 非强制路径不使用 {bps:.0f}bps 档，停止尝试，保留剩余 {remaining:.2f} 股")
                     break
                 try:
-                    res = self.hl_exchange.market_close(
-                        self.cfg.HL_SYMBOL, sz=chunk, slippage=bps / 10000.0)
+                    _touch = self.state.hl_bid_px if self.state.hl_bid_px > 0 else hl_mid
+                    _aggressive = round(_touch * (1.0 - bps / 10000.0), 2)
+                    res = self.hl_exchange.order(self.cfg.HL_SYMBOL, False, chunk, _aggressive, {"limit": {"tif": "Ioc"}})
                     filled, px = self._parse_hl_fill(res)
                 except Exception as e:
                     logger.error(f"❌ [{tag}] HL 拆单异常(尝试{attempt+1}): {e}")
@@ -938,7 +955,8 @@ class AtomicDualLegEngineV4:
             hl_equiv = hl_left
             okx_equiv = okx_left / ratio if ratio > 0 else okx_left
             smaller = min(hl_equiv, okx_equiv)
-            batch_hl = smaller * self.cfg.CLOSE_BATCH_PCT
+            batch_hl = max(smaller * self.cfg.CLOSE_BATCH_PCT, self.cfg.MIN_ORDER_USD / hl_mid if hl_mid > 0 else 0.01)
+            batch_hl = round(min(batch_hl, smaller), 2)
 
             # 尾差处理: 若按比例切出的量低于最小下单单位, 直接把两腿剩余全部平掉
             batch_okx = round(batch_hl * ratio, 3)
@@ -1148,6 +1166,16 @@ class AtomicDualLegEngineV4:
 
         return False
 
+    # [2026-11-11] 半价差成本: 两腿各自 (ask-bid)/2 / mid 的 bps
+    def _compute_live_crossing(self, hl_mid: float, okx_mid: float) -> float:
+        hls, okxs = 0.0, 0.0
+        if self.state.hl_ask_px > 0 and self.state.hl_bid_px > 0 and hl_mid > 0:
+            hls = (self.state.hl_ask_px - self.state.hl_bid_px) / hl_mid * 10000.0
+        _okx_eq = okx_mid * 10.0 / self.cfg.ASSUMED_SHARES_B if okx_mid > 0 else 0.0
+        if self.state.okx_ask_px > 0 and self.state.okx_bid_px > 0 and _okx_eq > 0:
+            okxs = (self.state.okx_ask_px - self.state.okx_bid_px) / _okx_eq * 10000.0
+        return hls / 2.0 + okxs / 2.0
+
     def check_combined_pnl_take_profit(self, hl_mid: float, okx_mid: float) -> bool:
         """
         双腿合计净利润率止盈守卫:
@@ -1170,10 +1198,25 @@ class AtomicDualLegEngineV4:
         total_pnl = pnl_hl + pnl_okx
         total_margin = margin_hl + margin_okx
         total_notional = (self.current_q_hl * hl_mid) + (abs(self.current_q_okx) * okx_mid)
+        _hn = abs(self.current_q_hl) * hl_mid; _on = abs(self.current_q_okx) * okx_mid
+        if min(_hn, _on) < self.cfg.MIN_ORDER_USD * 2.0 and max(_hn, _on) > self.cfg.MIN_ORDER_USD:
+            logger.warning(f"⚡ [residue] HL ${_hn:.2f} / OKX ${_on:.2f} -> market double-flatten")
+            self._close_hl_market_force(abs(self.current_q_hl))
+            try:
+                self.okx.place_order(inst_id=self.cfg.OKX_INST_ID, td_mode="cross", side="buy",
+                                     ord_type="market", sz=str(round(abs(self.current_q_okx),3)))
+            except Exception as e: logger.error(f"OKX residue flush: {e}")
+            return True
+
 
         if total_margin > 0.0:
             roi_on_margin = (total_pnl / total_margin) * 100.0
-            if roi_on_margin >= self.cfg.TARGET_NET_ROI_PCT:
+            _cross = self._compute_live_crossing(hl_mid, okx_mid)
+            _dyn = max(_cross * 2.5 / 10.0, 8.0)
+            self._last_roi_comp = dict(cross_bps=_cross, target=_dyn, roi=roi_on_margin, pnl=total_pnl)
+            if tick % 30 == 0:
+                logger.info(f"📐 [动态ROI] crossing={_cross:.1f}bps threshold={_dyn:.1f}% now={roi_on_margin:.1f}% pnl=${total_pnl:.2f}")
+            if roi_on_margin >= max(self.cfg.TARGET_NET_ROI_PCT, _dyn):
                 reason = f"双腿保证金净收益率达标 (+{roi_on_margin:.2f}% >= {self.cfg.TARGET_NET_ROI_PCT}%, 净浮盈: +${total_pnl:.2f} USD)"
                 logger.info(f"🎯 [触发综合净利润止盈] {reason}！立即双平落袋为安！")
                 self.execute_atomic_close(reason=reason, forced=False)
@@ -1369,15 +1412,20 @@ class AtomicDualLegEngineV4:
 
 
                 # 5. 状态机动作判断
+                # [2026-11-11] 时间止损: >12h ROI<5% -> 强制平
+                if (self.current_q_hl > 0.05 and abs(self.current_q_okx) > 0.005
+                        and time.time() - getattr(self, '_hold_since', 0.0) > 12 * 3600):
+                    _m = (abs(self.current_q_hl)*hl_mid+abs(self.current_q_okx)*okx_mid)/self.cfg.TARGET_LEVERAGE
+                    _r = (self.current_q_hl*(hl_mid-self.hl_entry_px)+abs(self.current_q_okx)*(self.okx_entry_px-okx_mid))/_m*100 if _m>0 else 0
+                    if _r < 5.0:
+                        logger.critical(f"⏰ [时间止损] {(time.time()-self._hold_since)/3600:.1f}h ROI {_r:.1f}% < 5% 强制平")
+                        if self.execute_atomic_close(reason=f"时间止损({(time.time()-self._hold_since)/3600:.1f}h)", forced=True):
+                            self._hold_since = time.time(); time.sleep(self.cfg.COOLDOWN_AFTER_FILL_SEC); continue
+
                 # 5.1 检查是否满足平仓条件 (持仓中且利差收窄)
                 if self.current_q_hl > 0.05 and abs(self.current_q_okx) > 0.005:
-                    # 触发波段止盈 (<= 500 bps) 或 规则终极收敛 (<= 50 bps)
-                    if close_spread_bps <= self.cfg.EXIT_SWING_PROFIT_BPS:
-                        logger.info(f"🎯 [触发波段止盈平仓] 反向利差回落至 {close_spread_bps:.1f} bps <= {self.cfg.EXIT_SWING_PROFIT_BPS} bps！立即双平落袋为安！")
-                        closed = self.execute_atomic_close(reason=f"利差收敛至 {close_spread_bps:.1f} bps 止盈", forced=False)
-                        if closed:
-                            time.sleep(self.cfg.COOLDOWN_AFTER_FILL_SEC)
-                            continue
+                    # [2026-11-11] 波段/终极止盈已删除；出场由动态 ROI + 时间止损管理
+                    pass
 
                 # 5.2 检查是否满足开仓/加仓条件
                 _halt = (getattr(self, "naked_halt", False) or getattr(self, "margin_halt", False)
