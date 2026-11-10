@@ -1339,16 +1339,21 @@ class AtomicDualLegEngineV4:
                         _n_okx = abs(q_okx) * okx_mid
                         _cap = min(min(_n_hl, _n_okx) * self.cfg.MAX_NAKED_USD_PCT_LEG,
                                    min(_eq_hl, _eq_okx) * self.cfg.MAX_NAKED_USD_PCT_EQ)
-                        _u_hl = _n_hl / (_eq_hl * self.cfg.TARGET_LEVERAGE) if _eq_hl > 0 else 0.0
-                        _u_okx = _n_okx / (_eq_okx * self.cfg.TARGET_LEVERAGE) if _eq_okx > 0 else 0.0
+                        _tot_n = _n_hl + _n_okx
+                        _tot_eq = _eq_hl + _eq_okx
+                        _u_total = _tot_n / (_tot_eq * self.cfg.TARGET_LEVERAGE) if _tot_eq > 0 else 0.0
                         self.naked_halt = (_cap > 0 and abs(net_delta) > _cap)
-                        self.margin_halt = (max(_u_hl, _u_okx) > self.cfg.MAX_LEG_MARGIN_PCT)
+                        self.margin_halt = (_u_total > 1.0)
                         if self.naked_halt and tick % 5 == 1:
                             logger.critical(
-                                f"🛑 [裸敞口超限] |{net_delta:.2f}| > 上限 {_cap:.2f} (腿名义 {min(_n_hl,_n_okx):.2f}, 权益 {min(_eq_hl,_eq_okx):.2f}) → 禁止开仓")
+                                f"🛑 [裸敞口超限] |{net_delta:.2f}| > 上限 {_cap:.2f} → 禁止开仓")
                         if self.margin_halt and tick % 5 == 1:
                             logger.critical(
-                                f"🛑 [保证金超限] HL {_u_hl*100:.0f}% / OKX {_u_okx*100:.0f}% > {self.cfg.MAX_LEG_MARGIN_PCT*100:.0f}% → 禁止开仓")
+                                f"🛑 [总杠杆超限] 总名义 ${_tot_n:.2f} / 总权益 ${_tot_eq:.2f} = {_u_total*100:.0f}% > 100% → 禁止开仓")
+                        # [2026-11-11] 两腿失衡 >10% 且 spread 达标 → 削腿重平衡
+                        _imb = abs(net_delta) / max(min(_n_hl, _n_okx), 1e-9) if min(_n_hl, _n_okx) > 0 else 0.0
+                        if _imb > 0.10 and tick % 5 == 1 and not self.naked_halt:
+                            logger.warning(f"⚖️ [两腿失衡] {_imb*100:.0f}% > 10% → 等待补/削腿触发")
                     except Exception as e:
                         logger.error(f"硬约束计算异常: {e}")
                         self.naked_halt = True
