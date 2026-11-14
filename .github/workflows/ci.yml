@@ -1,0 +1,155 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: 语法与配置校验
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 语法检查
+        run: python -m py_compile 04_preipo_cross_arb/core/ant_cross_arb_service.py
+
+      - name: 关键参数与口径校验
+        run: |
+          python - <<'PY'
+          import re, sys
+          src = open("04_preipo_cross_arb/core/ant_cross_arb_service.py", encoding="utf-8").read()
+          expect = {
+              "OKX_CONTRACT_SHARES": 1.005,   # 1 张 OKX 合约 = 1.005 股 ANT (rebase 后口径)
+              "TOTAL_SHARES_B": 13.07,         # 真实总股本 130.7 亿股
+              "ENTRY_SPREAD_BPS_FLOOR": 15.0,  # 门槛地板
+              "ENTRY_GATE_PERCENTILE": 90.0,   # 自适应门槛分位数
+              "TARGET_NET_ROI_PCT": 1.5,       # 止盈目标
+              "FRICTION_BPS": 18.0,            # 实测双边摩擦
+              "ASSUMED_SHARES_B": 13.07,       # 冷启动兜底必须是 rebase 后的真实股本
+              "ROI_MIN_PCT": 1.0,
+              "ROI_MAX_PCT": 5.0,
+              "TIME_STOP_HOURS": 8.0,
+          }
+          bad = []
+          for k, want in expect.items():
+              m = re.search(rf"^\s*{k}\s*=\s*([\d.]+)", src, re.M)
+              if not m:
+                  bad.append(f"{k} 缺失"); continue
+              got = float(m.group(1))
+              if abs(got - want) > 1e-9:
+                  bad.append(f"{k}={got} 期望 {want}")
+          # 旧口径残留检查: ×10/锚 的自指推导必须彻底移除
+          for pat in ("okx_px * 10.0", "10.0 / s_now", "10.0 / _anchor"):
+              if pat in src:
+                  bad.append(f"旧口径残留: {pat}")
+          # 时间止损必须是 8h (2026-11-14 由 4h 放宽, 依据 48h 回测)
+          if "TIME_STOP_HOURS = 8.0" not in src:
+              bad.append("TIME_STOP_HOURS 未设为 8.0")
+          if "> self.cfg.TIME_STOP_HOURS * 3600" not in src:
+              bad.append("时间止损未使用 TIME_STOP_HOURS 配置")
+          # BUG 回归: _anchor_s 必须取 _s_hist(股本) 的中位数, 不能取 _spread_hist(价差bps)
+          if "sorted(v for _, v in self._s_hist)" not in src:
+              bad.append("_anchor_s 量纲 bug 复发(应取 _s_hist 中位数)")
+          # BUG 回归: sigma 地板已删除 (它把 ROI 目标恒钉在 1.5% -> 永不可达)
+              _code = chr(10).join(l.split("#")[0] for l in src.split(chr(10)))
+          if "ROI_MIN_BPS" in _code or "dynamic_roi_target_pct" in _code:
+              bad.append("sigma 地板已删除, 不应再出现")
+          if "self._hold_since = 0.0" not in src:
+              bad.append("_hold_since 未在 __init__ 初始化")
+          if bad:
+              print("FAIL:"); [print("  -", b) for b in bad]; sys.exit(1)
+          print("配置校验通过")
+          PY
+
+  self-test:
+    name: 口径与决策链自检
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 决策链自检 (不依赖网络)
+        run: |
+          python - <<'PY'
+          import importlib.util, math, random, statistics as st, sys
+          from collections import deque
+          spec = importlib.util.spec_from_file_location("ant", "04_preipo_cross_arb/core/ant_cross_arb_service.py")
+          m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+          E = object.__new__(m.AtomicDualLegEngineV4)
+          E.cfg = m.EngineConfigV4
+          E._sp_hist = []; E._spread_hist = deque(maxlen=20000); E._s_hist = deque(maxlen=20000)
+          E._anchor_s = E.cfg.ASSUMED_SHARES_B; E._anchor_dev_pct = 0.0
+          E._entry_dev_bps = 0.0; E._entry_gate_bps = 0.0; E._hold_since = 0.0
+          fails = []
+          # 1) 每股等价与隐含股本
+          tok = E.okx_per_share(102.36)
+          if abs(tok - 101.85) > 0.2: fails.append(f"每股等价 {tok}")
+          imp = E.compute_implied_s(101.96, 102.38)
+          if abs(imp/13.07 - 1) > 0.02: fails.append(f"隐含股本 {imp}")
+          # 2) 配平: 两腿名义偏差 < 0.5%
+          ratio = 1.0/E.cfg.OKX_CONTRACT_SHARES
+          n_hl = 0.15*101.97; n_okx = 0.15*ratio*102.36
+          if abs(n_hl-n_okx)/n_hl > E.cfg.MAX_USD_DELTA_PCT: fails.append("配平偏差超限")
+          # 3) 锚: 同口径(价差)且非自指
+          random.seed(11)
+          now = 1763000000.0
+          for i in range(7200):
+              sp = -7.7 + random.gauss(0, 12)
+              E._spread_hist.append((now-7200+i, sp)); E._s_hist.append((now-7200+i, 13.06))
+              E.update_anchor(13.06, sp, now-7200+i)
+          if abs(E.spread_anchor_bps() + 7.7) > 2.5: fails.append("价差中枢偏离注入值")
+          # 4) 自适应门槛: 波动大->抬高, 小->降
+          E._sp_hist = [(now-4000+i, random.gauss(0, 8)) for i in range(4000)]
+          g_lo = E.entry_gate_bps()
+          E._sp_hist = [(now-4000+i, random.gauss(0, 60)) for i in range(4000)]
+          g_hi = E.entry_gate_bps()
+          if g_lo > E.cfg.ENTRY_SPREAD_BPS_FLOOR + 0.01: fails.append(f"低波动门槛未落地 {g_lo}")
+          if g_hi <= g_lo + 20: fails.append(f"高波动门槛未抬升 {g_lo}->{g_hi}")
+          # 5) ROI 目标: 夹到 [ROI_MIN_PCT, ROI_MAX_PCT]
+          for d, want in ((10, 1.0), (38, 1.0), (60, 2.1), (118, 5.0), (500, 5.0)):
+              E._entry_dev_bps = d
+              tgt = E.entry_roi_target_pct()
+              reach = max(0.0, (d - E.cfg.FRICTION_BPS)*0.05)
+              expect = max(E.cfg.ROI_MIN_PCT, min(E.cfg.ROI_MAX_PCT, reach))
+              if abs(tgt - expect) > 1e-9:
+                  fails.append(f"ROI 目标夹取错 d={d} tgt={tgt} expect={expect}")
+          # 6) 残量判定
+          MO = E.cfg.MIN_ORDER_USD
+          for hn, on, want in [(15.60,15.79,False),(9.0,15.0,True),(15.0,9.0,True),(5.0,5.0,False),(40.0,40.0,False)]:
+              if (min(hn,on) < MO and max(hn,on) >= MO) != want:
+                  fails.append(f"残量判定错 {hn}/{on}")
+          # 7) 最小手数
+          msz = E._hl_min_sz(104.0)
+          if msz*104 < E.cfg.MIN_ORDER_USD - 1e-9: fails.append(f"最小手数 {msz}")
+          if fails:
+              print("FAIL:"); [print("  -", f) for f in fails]; sys.exit(1)
+          print("自检通过")
+          PY
+
+  docker:
+    name: 镜像构建
+    runs-on: ubuntu-latest
+    needs: [lint, self-test]
+    steps:
+      - uses: actions/checkout@v4
+      - name: 构建并推送镜像
+        run: |
+          echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+          docker build -t ${{ secrets.DOCKER_USERNAME }}/ant-arb:${{ github.sha }} -t ${{ secrets.DOCKER_USERNAME }}/ant-arb:latest .
+          docker push ${{ secrets.DOCKER_USERNAME }}/ant-arb:${{ github.sha }}
+          docker push ${{ secrets.DOCKER_USERNAME }}/ant-arb:latest
