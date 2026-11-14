@@ -29,7 +29,7 @@ ENVF = "/etc/ant-arb.env"
 H = {"User-Agent": "Mozilla/5.0", "Content-Type": "application/json"}
 
 # 部署基线 (改动配置后同步更新)
-BASELINE_MD5 = "5e23ae16f856abfb33697f1b50933cb5"
+BASELINE_MD5 = "4818985d2d034d361e886fc5b91d5bd2"
 EXPECT = {
     "OKX_CONTRACT_SHARES": 1.005,
     "TOTAL_SHARES_B": 13.07,
