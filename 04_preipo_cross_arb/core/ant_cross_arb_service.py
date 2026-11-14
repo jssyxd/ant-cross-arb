@@ -30,6 +30,7 @@ import math
 import logging
 import asyncio
 import threading
+from collections import deque
 from typing import Dict, Any, Tuple, Optional
 from datetime import datetime, timezone
 
@@ -67,20 +68,78 @@ class EngineConfigV4:
     REFILL_SYMBOL = "BTC"
     
     # 股本假设与配平系数
-    ASSUMED_SHARES_B = 12.7       # 仅作无实时 S 时的兜底
-    HEDGE_RATIO = 10.0 / ASSUMED_SHARES_B  # 兜底比率 ~0.7874
+    # [2026-11-12] 锚点改为「自适应滚动中位数」：固定锚每逢交易所重定价就永久失真。
+    # 11-12 18:04 OKX 对 ANTHROPIC-USDT-SWAP(pre_market) 停牌后一次性重定价
+    # ($136.84 -> $104.33, -23.7%, 成交量 0)，HL 侧未动；隐含 S 从 13.2B 塌到 10.09B，
+    # 固定锚 13.2 让门禁利差恒为 -2363bps（机器人读数报废、方向判断反转）。
+    # 改为: 锚 = 近 ANCHOR_WINDOW_SEC 隐含 S 的滚动中位数(只用过去)，
+    # "点差"恒等于「相对近期中枢的偏离」，与 regime 无关，重定价后 1~2h 自愈。
+    # [2026-11-14] 冷启动兜底: 11-12 18:04 rebase 后隐含 S ≈ 13.06B, 旧值 10.09 会让
+    # _anchor_dev_pct 起步就偏离 +29% -> 撞 ANCHOR_MAX_DEV_PCT -> 前 2 分钟永远开不了仓。
+    ASSUMED_SHARES_B = 13.07      # 冷启动兜底(样本不足时用) = 真实总股本
+    # ===== [2026-11-13] 真实股数口径 (必须定义在 HEDGE_RATIO 之前) =====
+    # 1 张 OKX ANTHROPIC-USDT-SWAP 合约 = C 股 ANT。
+    # 11-12 18:04 OKX 对该合约做过一次 rebase (面值调整), 价格 137->105 一次性跳变。
+    # C 由「归一后两所价差≈0」反解得到: 18:04 前 1.3245, 之后 1.005。
+    # 交叉验证: 136.84/1.3245 = 103.31 ≈ 重定价后新合约价 104.33。
+    OKX_CONTRACT_SHARES = 1.005        # 1 张 OKX 合约 = 1.005 股 ANT (rebase 后口径)
+    TOTAL_SHARES_B = 13.07            # 真实总股本 130.7 亿股
+    ISSUE_PRICE_CAP_USD = 78.0         # 每股发行价区间上限 -> 估值上限 13.07B x $78 = $1.0195T
+    HEDGE_RATIO = 1.0 / OKX_CONTRACT_SHARES  # 兜底比率 (两腿股数中性)
     DYNAMIC_HEDGE_RATIO = True    # 开仓按隐含 S 实时配平, 消除 S 漂移的方向性敞口
     HEDGE_RATIO_S_OVERRIDE = 0.0  # 人工锁定配平股本(十亿股), 0=不覆盖
-    HEDGE_RATIO_BOUNDS = (0.55, 0.90)  # 动态比率硬区间 (S 约 11.1B~18.2B), 越界则放弃开仓
-    REF_SHARES_B = 12.70          # [2026-11-08] 统一到 12.7，与 ASSUMED_SHARES_B/HEDGE_RATIO 同锚
+    # ratio = 10/S。11-12 18:04 前 S≈13.2 -> ratio 0.757; 之后 S≈10.09 -> ratio 0.991。
+    # 上界 0.90 -> 1.10，否则重定价后 plan_dual_leg_position 会一直报「越界」而拒绝开仓。
+    HEDGE_RATIO_BOUNDS = (0.55, 1.10)  # 动态比率硬区间, 越界则放弃开仓
+    REF_SHARES_B = 10.09          # 冷启动兜底(参照折价口径)
+    # ===== 自适应锚参数 =====
+    ANCHOR_WINDOW_SEC = 7200.0    # 锚窗口 2h
+    ANCHOR_MIN_SAMPLES = 120      # 样本不足则退回 ASSUMED_SHARES_B(约 2 分钟 @1s)
+    ANCHOR_MAX_DEV_PCT = 3.0      # |S/锚-1| 超过 3% 视为锚未收敛(刚重定价), 暂停开仓
     
     # 核心利差门禁
-    ENTRY_SPREAD_BPS = 550.0            # [2026-11-11] 开仓利差门槛 (从750下调以适应路演启动后的spread收窄)
+    # [2026-11-13] 自适应分位数门槛的量级重标。
+    # 起因: 用户指出「过去2天零交易」。根因是门槛标定在了错误的量级上:
+    #   110bps 是用【坏掉的固定锚 13.2】标定的; 换成自适应锚 + 真实口径(13.07B 股, OKX rebase
+    #   归一, C: 18:04前 1.3245 -> 后 1.005)后, E 的实际摆动只有 p5 -24bps ~ p95 +22bps
+    #   (幅度仅 46bps), 门槛地板 40bps 恰好高于 p90 -> 触发率极低 -> 两天零交易。
+    # 现在: 门槛 = max(地板 15bps, 近 1h 的 E 分布 p90), 波动收缩时降到地板, 放大时自动抬升。
+    # 真实口径 48h 回测(POST 稳定段, 扣 15.7bps 实测双边摩擦):
+    #   自适应p90 + 地板15 + 可达ROI目标 -> 20 轮 胜率 95% ROI(扣费) +6.89% 中位 0.45h
+    #   同上但时间止损放宽到 8h -> 19 轮 胜率 100% ROI(扣费) +7.89% 强平 0 轮
+    #   (8h 与「不限时」在本窗口完全等价: 最慢的一笔 6.87h 就达标了)
+    ENTRY_SPREAD_BPS_FLOOR = 15.0     # 门槛地板: 低于此值毛差覆盖不了摩擦
+    ENTRY_GATE_PERCENTILE = 90.0      # 门槛取 E 分布的 p90 (严格高点)
+    ENTRY_GATE_WINDOW_SEC = 3600.0    # 门槛统计窗口 1h
+
+    # ===== [2026-11-14] 时间止损上限 (小时) =====
+    # 从 4h 放宽到 8h。依据 (48h 忠实回测, POST-rebase):
+    #   4h  20 轮 胜率 95%  ROI(扣费) +6.89%  强平 1 轮
+    #   8h  19 轮 胜率 100% ROI(扣费) +7.89%  强平 0 轮
+    #   不限 19 轮 胜率 100% ROI(扣费) +7.89%  强平 0 轮   (与 8h 完全等价)
+    # 唯一被 4h 砍掉的那笔 (11-13 12:40, D=+17.7bps): 4h 时 ROI -0.97%(正在回归途中),
+    # 再等 2.85h 就达标 (+0.30%)。4h 会砍掉「正在回来」的仓位, 8h 不会。
+    # 8h 仍能兜住真正不回归的死单, 且本窗口内不误伤。
+    TIME_STOP_HOURS = 8.0
     # [2026-11-11] EXIT_SWING_PROFIT_BPS 已删除: 7天 S 最低 13.22B=520bps, 从未触发
     # [2026-11-11] EXIT_TERMINAL_CONVERGE_BPS 已删除: 统一由 ROI 管理出场
     
     # 收益与风控红线
-    TARGET_NET_ROI_PCT = 8.0            # 双腿占用保证金净收益率 >= 8.0% 立即止盈双平 (4h 价差 sigma 约 7.6% of margin, 门槛需高于 1 sigma)
+    # [2026-11-11] ROI 不再写死 8%：pre-IPO 重定价后 S 从 13.9 落到 13.2，点差级别整体下移 ~500bps，
+    # 1h 价差波动 sigma 从 ~60bps 降到 ~15bps，8% (=160bps 净收敛) 在日内基本不可达。
+    # 改为「净收敛 bps」口径：目标净收敛 = (进场偏离 - FRICTION_BPS) × 0.05，夹到 [ROI_MIN_PCT, ROI_MAX_PCT]
+    # [2026-11-14] 删除旧的波动自适应地板(ROI_MIN_BPS / ROI_SIGMA_K / dynamic_roi_target_pct):
+    #   那个地板恒把目标钉在 1.5%(30bps 净收敛), 而当前 regime 的可达净捕获只有 ~1bps
+    #   -> 目标永不可达 -> 每笔都只能被 4h 时间止损砍 -> 期望转负。
+    #   ROI% = net_bps × 0.05   (margin = 名义/5)
+    # [2026-11-13] ROI 目标随 regime 重标: 当前 regime 的 E 摆动幅度仅 46bps,
+    #   扣 18bps 双边摩擦后净捕获上限 ≈ 28bps = 1.4% margin ROI。
+    #   沿用 3.0%(60bps) 会让止盈永远达不到 -> 只能被 4h 限时砍, 期望转负。
+    #   新目标 1.5%(30bps) 落在可捕获区间内, 且仍显著高于摩擦成本。
+    TARGET_NET_ROI_PCT = 1.5            # 净收敛 30bps
+    ROI_MIN_PCT = 1.0                    # 动态目标下限 (20bps 净收敛)
+    ROI_MAX_PCT = 5.0                    # 动态目标上限 (100bps 净收敛)
+    FRICTION_BPS = 18.0                  # 实测双边摩擦 (X-E 中位)，用于门槛地板与 ROI 目标
     SINGLE_LEG_MAX_PRICE_DRIFT = 0.16   # 单腿价格偏离开仓均价 16%，强制双平止损 (账户保证金使用率上限 50%, 可承受)
     MAX_EFFECTIVE_LEVERAGE = 5.0        # 总持仓有效杠杆上限提升至 5.0x，保留 50% 现金游隙抵御极端波动
     
@@ -113,6 +172,14 @@ class EngineConfigV4:
     CLOSE_BATCH_PCT = 0.50              # 同步平仓每批占「两腿较小可平量」的比例
     CLOSE_MAX_ROUNDS = 12               # 同步平仓最大轮数
     CLOSE_TAIL_MIN_HL = 0.05            # 收尾批允许平掉的 HL 下限(股), 防止无限细分
+    HL_SZ_DECIMALS = 2                  # xyz:ANT szDecimals=2 (步长 0.01 股)
+
+    # ===== [2026-11-11] HL 请求配额保护 =====
+    # HL 允许的请求数 ≈ 累计成交额($)×1；空仓还在 5s 轮询会把配额烧光，
+    # 之后连平仓单都被拒 → 裸腿。空仓时把 REST 轮询降到 60s，下单动作立即失效缓存。
+    POS_POLL_FLAT_SEC = 60.0            # 空仓时持仓巡检复用缓存时长
+    BAL_POLL_FLAT_SEC = 60.0            # 空仓时权益巡检复用缓存时长
+    BAL_POLL_OPEN_SEC = 15.0            # 持仓中权益巡检刷新间隔
     INSTANT_DRIFT_BPS = 8.5             # 瞬时漂移防狙击
     MAX_CARRY_LOSS_APR = 10.0           # 资金费率净支出最大容忍 10% APR
     TARGET_LEVERAGE = 10                # 双边统一打满 10x 杠杆，1:1 保证金占用对称
@@ -300,7 +367,35 @@ class AtomicDualLegEngineV4:
         self._depth_capped_q = None
         self.hl_entry_px = 0.0
         self.okx_entry_px = 0.0
-        
+
+        # [2026-11-11] REST 配额保护：持仓/权益缓存 + 下单失效标记
+        self._pos_cache = None
+        self._pos_dirty = True
+        self._bal_cache = None
+        self._bal_dirty = True
+        self._hl_last_err = ""
+        self._peak_q_hl = 0.0          # 本轮持仓峰值股数：作为 ROI 分母，避免部分平仓后 ROI 虚高
+        self._peak_q_okx = 0.0
+        self._sp_hist = []             # [(ts, 偏离度bps)] 近 6h 偏离度序列, 供门槛分位数与波动自适应 ROI
+        self._roi_log_ts = 0.0
+        # [2026-11-12] 自适应锚: 隐含 S 滚动中位数(只用过去, 不用未来)
+        self._s_hist = deque(maxlen=20000)   # (ts, implied_s)
+        self._anchor_s = self.cfg.ASSUMED_SHARES_B
+        self._anchor_dev_pct = 0.0
+        # [2026-11-12] 自适应门槛: 进场时把当时的 E 偏离与门槛一起记下来,
+        # 供「ROI 目标跟随进场偏离」使用(低波动 regime 下固定 ROI 目标会必然超时)。
+        self._entry_dev_bps = 0.0
+        self._entry_gate_bps = 0.0
+        # [2026-11-13] 价差锚: 近 ANCHOR_WINDOW_SEC 的【跨所价差】滚动中位数。
+        #   这是「偏离度」的定义基准 —— 必须与被测量的量同口径, 否则自指。
+        #   过去锚的是「隐含 S 的中位数」, 而 E 测的是「价格比相对自身中位数的偏离」,
+        #   两者数学上同形但量级不同, 导致门槛标定全错(两天零交易)。
+        self._spread_hist = deque(maxlen=20000)
+        # [2026-11-12] 必须在 __init__ 就初始化: 时间止损分支会直接读 self._hold_since,
+        #   而它原本只在开仓成功后才被赋值 -> 未开仓即持仓时抛 AttributeError,
+        #   被外层 except 吞成「主调度异常」(11-12 上午出现 109 次)。
+        self._hold_since = 0.0
+
         logger.info(f"V4 自适应复利与全风控闭环引擎初始化完成 | HL 地址: {hl_account} | Agent: {wallet.address}")
 
     def align_account_leverage(self):
@@ -318,8 +413,35 @@ class AtomicDualLegEngineV4:
                 logger.error(f"配置 OKX 杠杆异常 (尝试 {attempt}): {e}")
                 time.sleep(1.0)
 
+    def _mark_dirty(self):
+        """任何下单动作后立即失效持仓/权益缓存，保证对账读到的是新状态"""
+        self._pos_dirty = True
+        self._bal_dirty = True
+
+    def _quota_blocked(self) -> bool:
+        """HL 请求配额熔断中：所有下单通道(含平仓)关闭，只留孤儿仓市价兜底"""
+        return time.time() < getattr(self, "quota_until", 0.0)
+
+    def _hl_min_sz(self, px: float) -> float:
+        """HL 最小下单量(股)：按名义额向上取整到 szDecimals 步长。
+        HL 拒收 < $10 名义的单，「整仓全平」豁免，本函数只用于分批规划。"""
+        px = max(px, 1e-9)
+        step = 10.0 ** -self.cfg.HL_SZ_DECIMALS
+        raw = math.ceil(self.cfg.MIN_ORDER_USD / px / step) * step
+        return round(max(raw, step), self.cfg.HL_SZ_DECIMALS)
+
     def get_real_positions(self) -> Tuple[float, float, float]:
-        """获取底层真实持仓并计算 Net Delta"""
+        """获取底层真实持仓并计算 Net Delta
+
+        [2026-11-11] 配额保护：已知空仓且本轮无下单动作时复用缓存(默认 60s)，
+        避免 2 个 REST / 5s 烧光 HL 请求配额。持仓中永远走真实查询，
+        三态语义(读不到 != 平仓)不变。
+        """
+        _c = self._pos_cache
+        if (_c and not self._pos_dirty and getattr(self, "pos_state_known", False)
+                and time.time() - _c[0] < self.cfg.POS_POLL_FLAT_SEC
+                and abs(_c[1]) <= 0.01 and abs(_c[2]) <= 0.005):
+            return _c[1], _c[2], _c[3]
         q_hl = 0.0
         q_okx = 0.0
         hl_px = 0.0
@@ -367,6 +489,15 @@ class AtomicDualLegEngineV4:
         usd_okx = abs(q_okx) * _okx_ref
         net_delta = usd_hl - usd_okx
         self._last_usd_leg = max(min(abs(usd_hl), abs(usd_okx)), 1e-9)
+        if self.pos_state_known:
+            self._pos_cache = (time.time(), q_hl, q_okx, net_delta)
+            self._pos_dirty = False
+            if abs(q_hl) <= 0.01 and abs(q_okx) <= 0.005:
+                self._peak_q_hl = 0.0
+                self._peak_q_okx = 0.0
+            else:
+                self._peak_q_hl = max(self._peak_q_hl, abs(q_hl))
+                self._peak_q_okx = max(self._peak_q_okx, abs(q_okx))
         return q_hl, q_okx, net_delta
 
     def get_account_balances(self) -> Tuple[float, float, float, float]:
@@ -374,6 +505,10 @@ class AtomicDualLegEngineV4:
         获取双边可用资金与总权益
         返回: (w_hl_free, w_okx_free, w_hl_equity, w_okx_equity)
         """
+        _ttl = self.cfg.BAL_POLL_OPEN_SEC if (abs(self.current_q_hl) > 0.01 or abs(self.current_q_okx) > 0.005) else self.cfg.BAL_POLL_FLAT_SEC
+        _c = self._bal_cache
+        if _c and not self._bal_dirty and time.time() - _c[0] < _ttl:
+            return _c[1], _c[2], _c[3], _c[4]
         w_hl_free = 0.0
         w_hl_equity = 0.0
         w_okx_free = 0.0
@@ -401,6 +536,9 @@ class AtomicDualLegEngineV4:
         except Exception as e:
             logger.error(f"获取账户资金异常: {e}")
 
+        if w_hl_equity > 0 and w_okx_equity > 0:
+            self._bal_cache = (time.time(), w_hl_free, w_okx_free, w_hl_equity, w_okx_equity)
+            self._bal_dirty = False
         return w_hl_free, w_okx_free, w_hl_equity, w_okx_equity
 
     def _check_open_depth(self, q_hl: float, okx_px: float) -> Tuple[bool, str]:
@@ -433,8 +571,7 @@ class AtomicDualLegEngineV4:
             logger.warning(f"⚠️ [开仓深度预检] OKX 盘口读取失败: {e}")
             return True, "OKX 深度不可读, 仅校验 HL 侧"
 
-        s_now = self.compute_implied_s(self.state.hl_ask_px or 1.0, okx_px or 1.0)
-        ratio = 10.0 / s_now if s_now > 0 else self.cfg.HEDGE_RATIO
+        ratio = 1.0 / self.cfg.OKX_CONTRACT_SHARES
         need_okx = (self._depth_capped_q or q_hl) * ratio
         okx_cap = okx_depth * pct
         if okx_cap < need_okx:
@@ -470,23 +607,33 @@ class AtomicDualLegEngineV4:
             return {"ok": False, "reason": "隐含 S 不可用"}
 
         # 两个 S 各司其职, 不可混用:
-        #   s_ref   = 契约性参照股本, 用来判断「现在贵不贵」, 与开仓阈值比较
-        #   s_now   = 市场实时隐含股本, 用来定配平比率, 保证上市后两腿股数中性
+        #   s_ref   = 参照股本, 用来判断「现在贵不贵」, 与开仓阈值比较
+        #   s_now   = 市场实时隐含股本, 用来定配平比率, 保证两腿股数中性
+        # [2026-11-13] 全部改用真实股数口径 (1 张 OKX 合约 = OKX_CONTRACT_SHARES 股):
+        #   旧写法 okx*10/s_ref 里的 ×10 是「1 张 = 10/13.2 股」的隐含假设, rebase 后失效。
         if self.cfg.HEDGE_RATIO_S_OVERRIDE > 0:
             s_ref = self.cfg.HEDGE_RATIO_S_OVERRIDE
             s_hedge = self.cfg.HEDGE_RATIO_S_OVERRIDE
             s_src = "人工覆盖"
         else:
-            s_ref = self.cfg.REF_SHARES_B
+            s_ref = self._anchor_s
             s_hedge = s_now
-            s_src = "实时 S"
+            s_src = "自适应锚"
 
-        okx_eq_ref = okx_px * 10.0 / s_ref
-        edge_bps = (okx_eq_ref - hl_px) / hl_px * 10000.0
+        okx_eq_ref = self.okx_per_share(okx_px)
+        # [2026-11-14] 与门禁同口径: 执行价差(含 -6 haircut), 这样 edge_bps - 中枢 = 门禁用的 dev,
+        # 方向判断与开仓门禁永远一致(否则差 6bps 会让方向在边界上抖动)。
+        edge_bps = (okx_eq_ref - hl_px) / hl_px * 10000.0 - 6.0
         # [2026-11-09] 冗余门已删除
 
-        long_hl = edge_bps > 0
-        ratio = 10.0 / s_hedge
+        # [2026-11-13] 方向按【价差相对中枢的偏离】判断, 与门禁同口径:
+        #   价差高于中枢 -> OKX 相对贵 -> 买 HL 卖 OKX
+        #   价差低于中枢 -> OKX 相对便宜 -> 买 OKX 卖 HL
+        _anchor_spr = self.spread_anchor_bps()
+        _dev = edge_bps - _anchor_spr if _anchor_spr != 0.0 else edge_bps
+        long_hl = _dev > 0
+        # 配平比率: 两腿股数中性 = q_okx = q_hl / OKX_CONTRACT_SHARES
+        ratio = 1.0 / self.cfg.OKX_CONTRACT_SHARES
         lo, hi = self.cfg.HEDGE_RATIO_BOUNDS
         if ratio < lo or ratio > hi:
             return {"ok": False, "s": s_now,
@@ -535,7 +682,8 @@ class AtomicDualLegEngineV4:
             q_clip = round(q_min + 0.005, 2)          # 向上取到分, 越过门槛
         # 抬到最小股数后若超出剩余空间, 说明账户空间不足, 拒绝
         if q_clip * per_share_notional > room:
-            return {"ok": False, "s": s_now, "held": held, "max_notional": max_notional,
+            return {"ok": False, "s": s_now, "held": hl_held + okx_held,
+                    "max_notional": min(hl_max_notional, okx_max_notional),
                     "reason": (
                         f"剩余双边名义 ${room:.2f} 不足以开出最小合规单 "
                         f"(需 ${q_clip * per_share_notional:.2f}, HL {q_clip:.2f} 股)"
@@ -546,7 +694,8 @@ class AtomicDualLegEngineV4:
         # 会击穿盘口产生远超预期的滑点, 且对冲腿可能打不进去导致裸持。
         depth_ok, depth_note = self._check_open_depth(q_clip, okx_px)
         if not depth_ok:
-            return {"ok": False, "s": s_now, "held": held, "max_notional": max_notional,
+            return {"ok": False, "s": s_now, "held": hl_held + okx_held,
+                    "max_notional": min(hl_max_notional, okx_max_notional),
                     "reason": depth_note}
         if self._depth_capped_q is not None and self._depth_capped_q < q_clip:
             logger.info(
@@ -554,7 +703,8 @@ class AtomicDualLegEngineV4:
             )
             q_clip = self._depth_capped_q
             if q_clip < q_min:
-                return {"ok": False, "s": s_now, "held": held, "max_notional": max_notional,
+                return {"ok": False, "s": s_now, "held": hl_held + okx_held,
+                        "max_notional": min(hl_max_notional, okx_max_notional),
                         "reason": f"盘口深度不足: 压缩后 {q_clip:.2f} 股低于最小合规单 {q_min:.2f} 股"}
 
         self._depth_capped_q = None
@@ -588,6 +738,10 @@ class AtomicDualLegEngineV4:
         严格单向串联原子开仓:
         HL 买入 IOC -> 确认成交 -> 60ms 避开 STP -> OKX 市价对冲卖单
         """
+        if self._quota_blocked():
+            logger.critical(f"🛑 [配额熔断] 剩余 {self.quota_until - time.time():.0f}s 内禁止开仓")
+            return False
+        self._mark_dirty()
         # ===== 双边配平规划: 实时 S + 方向 + 双边名义约束 =====
         plan = self.plan_dual_leg_position(hl_ask, okx_bid)
         if not plan.get("ok"):
@@ -655,6 +809,11 @@ class AtomicDualLegEngineV4:
 
         if str(okx_res.get("code", "-1")) == "0":
             logger.info(f"🎉 [Leg 2 成交] OKX 对冲成功！双腿闭环完成 (耗时 {elapsed_okx_ms:.1f}ms)")
+            # [2026-11-12] 记录持仓起点与本次进场偏离:
+            #   _hold_since 之前从未设置(恒 0), 导致 12h 时间止损退化成「立即强平」;
+            #   _entry_dev_bps 供 ROI 止盈目标跟随进场偏离。
+            self._hold_since = time.time()
+            logger.info(f"⏱️ [持仓起点] 记录 _hold_since, {self.cfg.TIME_STOP_HOURS:g}h 时间止损从此刻计时")
             # 更新内部状态
             self.get_real_positions()
             return True
@@ -695,7 +854,9 @@ class AtomicDualLegEngineV4:
         hl_mid = (self.state.hl_ask_px + self.state.hl_bid_px) / 2.0 if self.state.hl_ask_px > 0 else 0
         if hl_mid <= 0: return False, 0.0, 0.0
         notional = q_hl * hl_mid
-        if notional > self.cfg.MIN_ORDER_USD * 1.5:
+        # [2026-11-12] market_close 只对「整仓」有意义, 上限放宽到 MIN_ORDER_USD*3 ($34.5),
+        # 否则真正的 $15 残量反而清不掉(旧上限 $17.25 把 $15.6 挡在外面)。
+        if notional > self.cfg.MIN_ORDER_USD * 3.0:
             return False, 0.0, 0.0
         logger.warning(f"⚡ [residue detect] HL ${notional:.2f} < ${self.cfg.MIN_ORDER_USD*1.5:.2f} -> market flush")
         try:
@@ -712,6 +873,13 @@ class AtomicDualLegEngineV4:
         盘口预检 + 动态拆单平掉 HL 仓位 (多头或空头)。
         q_hl 带符号: 正数 = 多头待平, 负数 = 空头待平。
         返回 (全部成交, 累计成交股数, 加权均价)
+
+        [2026-11-11] 按「最小名义额 + 步长」规划拆单（HL 拒收 < $10 名义的挂单，
+        但整仓全平豁免：Order must have minimum value of $10）：
+          1. 总名义 < $10 → 一次整仓全平；
+          2. 否则批次数 = 总量 / 最小手数，每批 >= 最小手数，尾巴并入前面的批次；
+          3. 任何 < 最小手数且非整仓全平的单，一律不发，把残量留给下一轮；
+          4. 命中配额错误 / 最小额错误 → 立刻停阶梯，不再空转烧配额。
         """
         sz_total = abs(q_hl)
         if sz_total <= 0.005:
@@ -720,34 +888,61 @@ class AtomicDualLegEngineV4:
         is_long = q_hl > 0
         side = "bid" if is_long else "ask"      # 平多打买盘, 平空打卖盘
         side_label = "买一" if is_long else "卖一"
+        px_touch = self.state.hl_bid_px if is_long else self.state.hl_ask_px
+        px_ref = px_touch if px_touch > 0 else (self.hl_entry_px or 1.0)
+        min_sz = self._hl_min_sz(px_ref)
 
-        book = self._get_hl_book(side=side)
-        if book:
-            best_px, best_sz = book[0]
-            max_chunk = max(0.01, round(best_sz * self.cfg.CLOSE_DEPTH_PCT, 2))
-            depth_ok = remaining_depth = 0.0
-            for px, sz in book:
-                remaining_depth += sz
-                if remaining_depth >= sz_total:
-                    depth_ok = px
-                    break
+        # 1. 全仓名义不足一手 → 整仓一次全平
+        if sz_total * px_ref < self.cfg.MIN_ORDER_USD:
             logger.info(
-                f"📖 [{tag}] HL 盘口预检({side_label}): ${best_px:.3f}×{best_sz:.2f}股 | "
-                f"待平 {sz_total:.2f}股 ({'多' if is_long else '空'}) | 单笔上限 {max_chunk:.2f}股 | "
-                + (f"吃满所需价位 ${depth_ok:.3f}" if depth_ok else "深度不足，将逐档吃")
+                f"🔚 [{tag}] 待平 {sz_total:.2f} 股 ≈ ${sz_total * px_ref:.2f} "
+                f"< 最小额 ${self.cfg.MIN_ORDER_USD:.0f} → 整仓全平(豁免最小额)"
             )
-        else:
-            max_chunk = sz_total
-            logger.warning(f"⚠️ [{tag}] 无盘口数据，退化为单笔平仓 (滑点仍限 {self.cfg.CLOSE_SLIPPAGE_BPS:.0f}bps)")
+            filled, px = self._hl_flush_whole(q_hl, tag)
+            return filled >= sz_total - 0.005, filled, px
 
-        remaining = round(sz_total, 2)
+        # 2. 批次数由总量决定，保证每批都过最小额
+        n_batches = max(1, int(sz_total // min_sz))
+        batch_sz = round(sz_total / n_batches, self.cfg.HL_SZ_DECIMALS)
+        logger.info(
+            f"🧮 [{tag}] 拆单规划: 总量 {sz_total:.2f} 股 | 最小手数 {min_sz:.2f} 股 "
+            f"(${self.cfg.MIN_ORDER_USD:.0f}/{px_ref:.2f}) → {n_batches} 批 × {batch_sz:.2f} 股"
+        )
+
+        remaining = round(sz_total, self.cfg.HL_SZ_DECIMALS)
         filled_total = 0.0
         cost = 0.0
         chunks = 0
-        while remaining > 0.005 and chunks < 20:
-            chunk = round(min(remaining, max_chunk), 2)
-            if chunk < 0.01:
+        while remaining > 0.005 and chunks < 40:   # 40 = 上限 20 笔/轮 × 2，容纳大仓位的分批数
+            book = self._get_hl_book(side=side)          # 每批重算盘口，不用进循环前的旧快照
+            depth_cap = batch_sz
+            if book:
+                best_px, best_sz = book[0]
+                depth_cap = max(min_sz, round(best_sz * self.cfg.CLOSE_DEPTH_PCT, self.cfg.HL_SZ_DECIMALS))
+                _acc = 0.0
+                depth_ok = 0.0
+                for px, szl in book:
+                    _acc += szl
+                    if _acc >= remaining:
+                        depth_ok = px
+                        break
+                logger.info(
+                    f"📖 [{tag}] HL 盘口预检({side_label}): ${best_px:.3f}×{best_sz:.2f}股 | "
+                    f"待平 {remaining:.2f}股 | 单批 {batch_sz:.2f}股(深度上限 {depth_cap:.2f}) | "
+                    + (f"吃满所需价位 ${depth_ok:.3f}" if depth_ok else "深度不足，将逐档吃")
+                )
+
+            chunk = round(min(remaining, batch_sz, depth_cap), self.cfg.HL_SZ_DECIMALS)
+            if chunk < min_sz:
+                chunk = round(min(remaining, min_sz), self.cfg.HL_SZ_DECIMALS)
+            # 3. 最小额守门：< $10 的单只允许「整仓全平」
+            if chunk * px_ref < self.cfg.MIN_ORDER_USD and chunk < sz_total - 0.005:
+                logger.warning(
+                    f"🛑 [{tag}] 本批 {chunk:.2f} 股 ≈ ${chunk * px_ref:.2f} < HL 最小额 $10 且非整仓全平 "
+                    f"→ 不发单，保留 {remaining:.2f} 股交下一轮"
+                )
                 break
+
             filled = px = 0.0
             _t0 = time.time()
             for attempt, (bps, _deadline) in enumerate(self.cfg.CLOSE_SLIPPAGE_LADDER):
@@ -757,9 +952,10 @@ class AtomicDualLegEngineV4:
                     logger.warning(f"🛑 [{tag}] 非强制路径不使用 {bps:.0f}bps 档，停止尝试，保留剩余 {remaining:.2f} 股")
                     break
                 try:
-                    _touch = self.state.hl_bid_px if self.state.hl_bid_px > 0 else hl_mid
+                    _touch = px_touch if px_touch > 0 else px_ref
                     _aggressive = round(_touch * (1.0 - bps / 10000.0), 2)
                     res = self.hl_exchange.order(self.cfg.HL_SYMBOL, False, chunk, _aggressive, {"limit": {"tif": "Ioc"}})
+                    self._mark_dirty()
                     filled, px = self._parse_hl_fill(res)
                 except Exception as e:
                     logger.error(f"❌ [{tag}] HL 拆单异常(尝试{attempt+1}): {e}")
@@ -768,13 +964,19 @@ class AtomicDualLegEngineV4:
                     if attempt > 0:
                         logger.warning(f"⚠️ [{tag}] 放宽至 {bps:.0f}bps 后成交 {filled:.2f}股 @ ${px:.4f}")
                     break
+                if self._hl_last_err == "quota":
+                    logger.critical(f"🛑 [{tag}] HL 配额熔断中，停止拆单（剩 {remaining:.2f} 股），不再空转")
+                    break
+                if self._hl_last_err == "min_value":
+                    logger.warning(f"⚠️ [{tag}] 最小额拒单({chunk:.2f} 股) → 放弃本批")
+                    break
                 time.sleep(0.4)
             if filled <= 0:
                 logger.error(f"❌ [{tag}] HL 拆单最终未成交，剩余 {remaining:.2f} 股未平！")
                 break
             filled_total += filled
             cost += filled * px
-            remaining = round(remaining - filled, 2)
+            remaining = round(remaining - filled, self.cfg.HL_SZ_DECIMALS)
             chunks += 1
             if remaining > 0.005:
                 time.sleep(self.cfg.CLOSE_CHUNK_INTERVAL_SEC)
@@ -844,10 +1046,12 @@ class AtomicDualLegEngineV4:
         """[2026-11-09] 补偿腿：只补「缺的那条腿」，把两腿拉回美元中性。
 
         与「开仓」的本质区别：本方法只允许 **减小** |net_delta|，绝不新增净敞口。
-        触发前置条件（调用方保证）：价差 >= ENTRY_SPREAD_BPS(550)、非 quota 熔断。
+        触发前置条件（调用方保证）：价差 >= 自适应门槛 entry_gate_bps()、非 quota 熔断。
         返回 True 表示本轮发出了一笔补腿单。
         """
         now = time.time()
+        if self._quota_blocked():
+            return False
         if now - getattr(self, "_topup_last_ts", 0.0) < self.cfg.TOPOUT_COOLDOWN_SEC:
             return False
         q_hl, q_okx, net = self.get_real_positions()
@@ -861,17 +1065,18 @@ class AtomicDualLegEngineV4:
         # 不是「两腿此刻市价之差」，而是「缺腿此刻市价 vs 另一腿的持仓均价（折算同量纲）」。
         # 买 HL：对比 OKX 持仓均价折算成每股；卖 OKX：对比 HL 持仓均价折算成每张。
         if net < 0:
-            _other_basis = self.okx_entry_px * 10.0 / self.cfg.ASSUMED_SHARES_B   # OKX 均价 → 每股等价
+            _other_basis = self.okx_entry_px / self.cfg.OKX_CONTRACT_SHARES         # OKX 均价 → 每股等价
             _edge_basis = ((_other_basis - hl_px) / hl_px * 10000.0) if hl_px > 0 else 0.0
             _act = f"买 HL(现 {hl_px:.2f}) vs OKX均价折每股 {_other_basis:.2f}"
         else:
-            _other_basis = self.hl_entry_px * self.cfg.ASSUMED_SHARES_B / 10.0    # HL 均价 → 每张等价
+            _other_basis = self.hl_entry_px * self.cfg.OKX_CONTRACT_SHARES          # HL 均价 → 每张等价
             _edge_basis = ((okx_px - _other_basis) / _other_basis * 10000.0) if _other_basis > 0 else 0.0
             _act = f"卖 OKX(现 {okx_px:.2f}) vs HL均价折每张 {_other_basis:.2f}"
-        if _edge_basis < self.cfg.ENTRY_SPREAD_BPS:
-            logger.info(f"⚖️ [补腿-未达价差] {_act} → {_edge_basis:+.0f}bps < 门槛 {self.cfg.ENTRY_SPREAD_BPS:.0f}bps，不补")
+        _gate = self.entry_gate_bps()
+        if _edge_basis < _gate:
+            logger.info(f"⚖️ [补腿-未达价差] {_act} → {_edge_basis:+.0f}bps < 门槛 {_gate:.0f}bps，不补")
             return False
-        logger.info(f"⚖️ [补腿-价差达标] {_act} → {_edge_basis:+.0f}bps ≥ {self.cfg.ENTRY_SPREAD_BPS:.0f}bps，执行补腿")
+        logger.info(f"⚖️ [补腿-价差达标] {_act} → {_edge_basis:+.0f}bps ≥ {_gate:.0f}bps，执行补腿")
         _wfh, _wfo, eq_hl, eq_okx = self.get_account_balances()
         if eq_hl <= 0 or eq_okx <= 0:
             return False
@@ -932,9 +1137,15 @@ class AtomicDualLegEngineV4:
         if abs(q_hl) <= 0.01 and abs(q_okx) <= 0.005:
             logger.info("当前无有效持仓，无需平仓。")
             return True
+        # [2026-11-11] 配额熔断期间所有下单通道关闭（含平仓），只留孤儿仓市价兜底
+        if self._quota_blocked():
+            logger.critical(
+                f"🛑 [配额熔断-平仓挂起] 剩余 {self.quota_until - time.time():.0f}s 内不主动平仓 "
+                f"(原因: {reason})；若出现单腿裸奔，孤儿清理器仍会市价兜底"
+            )
+            return False
 
-        S_now = self.compute_implied_s(self.state.hl_bid_px or 1.0, self.state.okx_bid_px or 1.0)
-        ratio = 10.0 / S_now if S_now > 0 else self.cfg.HEDGE_RATIO
+        ratio = 1.0 / self.cfg.OKX_CONTRACT_SHARES
 
         logger.warning(
             f"🚨 [执行双腿同步平仓] 原因: {reason} | 目标: HL {q_hl:+.2f} 股, OKX {q_okx:+.3f} 张 | "
@@ -955,11 +1166,21 @@ class AtomicDualLegEngineV4:
             hl_equiv = hl_left
             okx_equiv = okx_left / ratio if ratio > 0 else okx_left
             smaller = min(hl_equiv, okx_equiv)
-            batch_hl = max(smaller * self.cfg.CLOSE_BATCH_PCT, self.cfg.MIN_ORDER_USD / hl_mid if hl_mid > 0 else 0.01)
-            batch_hl = round(min(batch_hl, smaller), 2)
-
-            # 尾差处理: 若按比例切出的量低于最小下单单位, 直接把两腿剩余全部平掉
-            batch_okx = round(batch_hl * ratio, 3)
+            # [2026-11-11] hl_mid 在此作用域不存在(原为 NameError)，改用实时买价近似
+            hl_ref = self.state.hl_bid_px or (self.hl_entry_px or 1.0)
+            min_sz = self._hl_min_sz(hl_ref)
+            batch_hl = max(smaller * self.cfg.CLOSE_BATCH_PCT, min_sz)
+            batch_hl = round(min(batch_hl, hl_left), 2)
+            # 尾差处理: 两腿剩余不足一手 → 整仓全平（HL 对全平豁免 $10 下限）
+            if hl_left * hl_ref < self.cfg.MIN_ORDER_USD:
+                batch_hl = round(hl_left, 2)
+                batch_okx = round(okx_left, 3)
+                logger.warning(
+                    f"🔚 [同步平仓 尾批] 剩余 HL {hl_left:.2f} 股 ≈ ${hl_left * hl_ref:.2f} < 最小额 "
+                    f"→ 两腿整仓全平: HL {batch_hl:.2f} 股 + OKX {batch_okx:.3f} 张"
+                )
+            else:
+                batch_okx = round(batch_hl * ratio, 3)
             batch_hl = round(batch_hl, 2)
             if batch_hl < 0.01 or batch_okx < 0.001:
                 batch_hl = round(min(hl_equiv, self.cfg.CLOSE_TAIL_MIN_HL), 2)
@@ -1042,14 +1263,14 @@ class AtomicDualLegEngineV4:
 
         if self.cfg.HEDGE_RATIO_S_OVERRIDE > 0:
             s_use = self.cfg.HEDGE_RATIO_S_OVERRIDE
-            ratio = 10.0 / s_use
+            ratio = 1.0 / self.cfg.OKX_CONTRACT_SHARES
             return ratio, f"人工锁定 S={s_use:.2f}B -> ratio {ratio:.4f}"
 
         s_now = self.compute_implied_s(hl_px, okx_px)
         if s_now <= 0:
             return self.cfg.HEDGE_RATIO, "隐含 S 不可用，回落兜底比率"
 
-        ratio = 10.0 / s_now
+        ratio = 1.0 / self.cfg.OKX_CONTRACT_SHARES
         lo, hi = self.cfg.HEDGE_RATIO_BOUNDS
         if ratio < lo or ratio > hi:
             return 0.0, (
@@ -1057,33 +1278,127 @@ class AtomicDualLegEngineV4:
             )
         return ratio, f"动态配平 S={s_now:.2f}B -> ratio {ratio:.4f}"
 
-    def compute_edge_bps(self, hl_px: float, okx_px: float) -> float:
+    def update_anchor(self, implied_s: float, spread_bps: float = None, now: float = None) -> float:
+        """更新自适应锚: 近 ANCHOR_WINDOW_SEC【跨所价差】的滚动中位数(只用过去)。
+
+        [2026-11-13] 语义修正 —— 这是「零交易」的核心 bug:
+          旧版锚的是「隐含 S 的中位数」, 而 E 测的是「OKX价*10/锚 vs HL价」,
+          即价格比相对自身中位数的偏离。因为 10 与锚里隐含的 1/C 相消, 这个量
+          数学上等价于「真实价差相对自身中位数的偏离」, 与【绝对估值差】无关。
+          结果: 两所之间 50bps 的稳定水平差被完全吃掉, 只剩 ±22bps 的短期摆动,
+          而门槛按坏锚标定在 110bps -> 永远够不到 -> 两天零交易。
+          现在锚的是同口径的真实价差, 门槛和 ROI 目标都在同一量纲上标定。
         """
-        参照股本口径的跨所折价 (bps)。正数 = OKX 贵, 负数 = HL 贵。
-        与门禁利差 (ASSUMED_SHARES_B 口径) 是两个不同量:
-          门禁利差 = (OKX价*10/12.7 - HL价)/HL价, 回答「值不值得开」;
-          参照折价 = (OKX价*10/13.70 - HL价)/HL价, 回答「往哪个方向开」。
+        now = now if now is not None else time.time()
+        self._s_hist.append((now, implied_s))
+        cutoff = now - self.cfg.ANCHOR_WINDOW_SEC
+        while self._s_hist and self._s_hist[0][0] < cutoff:
+            self._s_hist.popleft()
+        if spread_bps is not None:
+            self._spread_hist.append((now, spread_bps))
+            while self._spread_hist and self._spread_hist[0][0] < cutoff:
+                self._spread_hist.popleft()
+        if len(self._spread_hist) < self.cfg.ANCHOR_MIN_SAMPLES:
+            self._anchor_s = self.cfg.ASSUMED_SHARES_B
+            self._anchor_dev_pct = (implied_s / self._anchor_s - 1.0) * 100.0
+            return self._anchor_s
+        # [2026-11-14] BUG FIX: _anchor_s 的量纲是【股本(B)】, 必须取 _s_hist (隐含S序列) 的中位数。
+        # 旧代码误取 _spread_hist (价差bps序列) 的中位数 -> _anchor_s 变成 -7.3 (bps),
+        # 于是 _anchor_dev_pct = (13.06 / -7.3 - 1)*100 = -279% -> 恒超 ANCHOR_MAX_DEV_PCT(3%)
+        # -> _anchor_ok 永远 False -> 机器人自 11-14 起【完全无法开仓】(日志"锚未收敛 -279%"即实证)。
+        vals = sorted(v for _, v in self._s_hist)
+        self._anchor_s = vals[len(vals) // 2]
+        self._anchor_dev_pct = (implied_s / self._anchor_s - 1.0) * 100.0
+        return self._anchor_s
+
+    def spread_anchor_bps(self) -> float:
+        """当前价差中枢 (bps)。样本不足时返回 0.0。"""
+        if len(self._spread_hist) < self.cfg.ANCHOR_MIN_SAMPLES:
+            return 0.0
+        vals = sorted(v for _, v in self._spread_hist)
+        return vals[len(vals) // 2]
+
+    def entry_gate_bps(self) -> float:
+        """自适应进场门槛 = max(地板, 近 ENTRY_GATE_WINDOW_SEC 的【偏离度 E】分布 p90)。
+
+        为什么要自适应:
+          - 固定门槛在波动收缩的 regime 永远够不到 -> 永久空转(11-12 零交易两天就是这个原因);
+          - 波动放大时固定门槛又太松, 会在噪音区开仓。
+        p90 门槛能同时满足「波动大时抬高、波动小时降低」, 地板保证毛差至少覆盖摩擦。
+
+        [2026-11-13] 统计对象必须是【偏离度 E = 跨所价差 - 价差中枢】, 不是价差本身。
+        价差本身有稳定的水平差, 直接取它的 p90 会把水平差当成信号。
+        """
+        cutoff = time.time() - self.cfg.ENTRY_GATE_WINDOW_SEC
+        vals = sorted(v for ts, v in self._sp_hist if ts >= cutoff)
+        if len(vals) < 200:
+            return self.cfg.ENTRY_SPREAD_BPS_FLOOR
+        p = vals[min(len(vals) - 1, int(len(vals) * self.cfg.ENTRY_GATE_PERCENTILE / 100.0))]
+        return max(self.cfg.ENTRY_SPREAD_BPS_FLOOR, p)
+
+    def entry_roi_target_pct(self) -> float:
+        """ROI 止盈目标(%)：跟随本次进场时的价差偏离, 保证可达。
+
+        固定 ROI 目标(如 3.0% = 60bps 净收敛)在低波动 regime 下必然超时 ——
+        捕获上限就那么多, 只能等 4h 时间止损砍掉, 期望值转负。
+        这里改成: 目标 = (进场偏离 - 摩擦) 折成的 margin ROI, 再夹到 [下限, 上限]。
+        进场偏离越大目标越高, 但始终可达(价差收敛回锚点即可兑现)。
+        """
+        if self._entry_dev_bps <= 0:
+            return self.cfg.TARGET_NET_ROI_PCT
+        # 进场偏离 D bps -> 完全回归中枢可捕获 D bps 毛差; 扣摩擦后净捕获 (D-18) bps。
+        # 目标取「净捕获」与「固定地板」的较小者 —— 目标绝不能高于可达上限, 否则必然超时被砍。
+        reach = max(0.0, (self._entry_dev_bps - self.cfg.FRICTION_BPS) * 0.05)
+        # [2026-11-14] 夹到 [ROI_MIN_PCT, ROI_MAX_PCT]: 地板是硬下限, 上限是硬上限。
+        # 旧实现 lo=min(下限, reach) 会让中间值跌破下限(0.5% < 1.0%), 与配置语义矛盾。
+        return max(self.cfg.ROI_MIN_PCT, min(self.cfg.ROI_MAX_PCT, reach))
+
+    def anchor_ready(self) -> bool:
+        """锚是否已收敛: |S/锚-1| 超阈值说明刚发生重定价, 此时方向判断不可信, 禁止开新仓"""
+        return len(self._s_hist) >= self.cfg.ANCHOR_MIN_SAMPLES
+
+    def okx_per_share(self, okx_px: float) -> float:
+        """OKX 合约价 -> 每股等价。
+
+        1 张 OKX ANTHROPIC-USDT-SWAP 合约 = C 股 ANT (C 见 OKX_CONTRACT_SHARES)。
+        11-12 18:04 OKX 做过一次 rebase (合约面值调整), C 从 1.3245 变成 1.005;
+        旧口径 (把 ×10 硬编码在 implied_s 里) 在 rebase 后整个失真。
+        """
+        return okx_px / self.cfg.OKX_CONTRACT_SHARES
+
+    def compute_edge_bps(self, hl_px: float, okx_px: float) -> float:
+        """跨所折价 (bps), 真实股数口径。正数 = OKX 贵, 负数 = HL 贵。
+
+        [2026-11-13] 改为显式口径: (OKX每股等价 / HL每股 - 1) * 1e4,
+        而非旧的 (OKX价*10/锚 - HL价)/HL价 —— 后者的 ×10 与锚里隐含的 1/C 相消,
+        得到的其实是「价格比相对自身中位数的偏离」, 与绝对估值差无关(自指)。
         """
         if hl_px <= 0 or okx_px <= 0:
             return 0.0
-        s_ref = self.cfg.HEDGE_RATIO_S_OVERRIDE if self.cfg.HEDGE_RATIO_S_OVERRIDE > 0 else self.cfg.REF_SHARES_B
-        okx_eq = okx_px * 10.0 / s_ref
+        okx_eq = self.okx_per_share(okx_px)
         return (okx_eq - hl_px) / hl_px * 10000.0
 
     def compute_implied_s(self, hl_px: float, okx_px: float) -> float:
-        """市场隐含流通股本 S (十亿股)。S = OKX 价 * 10B / HL 价"""
+        """市场隐含流通股本 S (十亿股) = OKX每股等价 × 总股本 / HL每股。
+
+        [2026-11-13] 旧公式 okx*10/hl 隐含「1 张 OKX 合约 = 10/13.2 股」这一与实际不符的假设。
+        现在: S = (OKX价/C) / HL价 × TOTAL_SHARES_B, 口径自洽且与真实股本一致。
+        """
         if hl_px <= 0 or okx_px <= 0:
             return 0.0
-        return okx_px * 10.0 / hl_px
+        return self.okx_per_share(okx_px) / hl_px * self.cfg.TOTAL_SHARES_B
 
     def compute_breakeven_s(self) -> float:
-        """当前持仓的盈亏平衡股本。S_be = OKX 开仓价 * 10B / HL 开仓价"""
+        """当前持仓的盈亏平衡股本。S_be = (OKX开仓价/C) / HL开仓价 × 总股本"""
         if self.hl_entry_px <= 0 or self.okx_entry_px <= 0:
             return 0.0
-        return self.okx_entry_px * 10.0 / self.hl_entry_px
+        return self.okx_entry_px / self.cfg.OKX_CONTRACT_SHARES / self.hl_entry_px * self.cfg.TOTAL_SHARES_B
 
     def execute_atomic_deleverage(self, fraction: float, reason: str) -> bool:
         """按比例削减双腿仓位，保持对冲比率。fraction=0.5 表示各减一半"""
+        if self._quota_blocked():
+            logger.critical(f"🛑 [配额熔断] 剩余 {self.quota_until - time.time():.0f}s 内禁止减仓")
+            return False
         q_hl, q_okx, _ = self.get_real_positions()
         hl_cut = math.floor(q_hl * fraction * 100) / 100.0
         okx_cut = math.floor(abs(q_okx) * fraction * 1000) / 1000.0
@@ -1171,10 +1486,36 @@ class AtomicDualLegEngineV4:
         hls, okxs = 0.0, 0.0
         if self.state.hl_ask_px > 0 and self.state.hl_bid_px > 0 and hl_mid > 0:
             hls = (self.state.hl_ask_px - self.state.hl_bid_px) / hl_mid * 10000.0
-        _okx_eq = okx_mid * 10.0 / self.cfg.ASSUMED_SHARES_B if okx_mid > 0 else 0.0
+        _okx_eq = self.okx_per_share(okx_mid) if okx_mid > 0 else 0.0
         if self.state.okx_ask_px > 0 and self.state.okx_bid_px > 0 and _okx_eq > 0:
             okxs = (self.state.okx_ask_px - self.state.okx_bid_px) / _okx_eq * 10000.0
         return hls / 2.0 + okxs / 2.0
+
+    def _spread_sigma_1h(self) -> float:
+        """近 6h【偏离度】的 1 小时波动 sigma，单位 bps。
+
+        [2026-11-11] 这是 ROI 的动态锚：点差收敛能吃到多少，取决于它自己有多能波动。
+        用 5 分钟分桶的桶间差分求 sigma，再按 sqrt(12) 放大到小时级别。
+        [2026-11-13] 输入已改为偏离度序列(与门禁同口径)。
+        样本不足(<20 桶)时返回 0，由调用方回落到配置下限。
+        """
+        now = time.time()
+        # [2026-11-13] 避免每 tick 重建整个列表(O(n^2)): 只在需要时裁剪
+        if self._sp_hist and now - self._sp_hist[0][0] > 6 * 3600:
+            self._sp_hist = [(t, v) for (t, v) in self._sp_hist if now - t <= 6 * 3600]
+        if len(self._sp_hist) < 20:
+            return 0.0
+        buckets = {}
+        for t, v in self._sp_hist:
+            buckets.setdefault(int(t // 300), []).append(v)
+        keys = sorted(buckets)
+        if len(keys) < 20:
+            return 0.0
+        pts = [sum(buckets[k]) / len(buckets[k]) for k in keys]
+        diffs = [abs(pts[i] - pts[i - 1]) for i in range(1, len(pts))]
+        mu = sum(diffs) / len(diffs)
+        sd = math.sqrt(sum((d - mu) ** 2 for d in diffs) / max(1, len(diffs) - 1))
+        return sd * math.sqrt(12.0)
 
     def check_combined_pnl_take_profit(self, hl_mid: float, okx_mid: float) -> bool:
         """
@@ -1188,19 +1529,28 @@ class AtomicDualLegEngineV4:
 
         # 1. 计算 HL 浮动盈亏 (多头)
         pnl_hl = self.current_q_hl * (hl_mid - self.hl_entry_px)
-        # 10x 杠杆占用保证金
-        margin_hl = (self.current_q_hl * self.hl_entry_px) / self.cfg.TARGET_LEVERAGE
+        # [2026-11-11] 分母改用「本轮峰值持仓」的入场保证金：原实现用当前剩余量，
+        # 部分平仓后分母趋零会让 ROI 虚高到 40~50%，从而反复触发无效平仓(实测 259 次刷屏)。
+        _hl_ref_q = max(self._peak_q_hl, self.current_q_hl)
+        _okx_ref_q = max(self._peak_q_okx, abs(self.current_q_okx))
+        margin_hl = (_hl_ref_q * self.hl_entry_px) / self.cfg.TARGET_LEVERAGE
 
         # 2. 计算 OKX 浮动盈亏 (空头)
         pnl_okx = abs(self.current_q_okx) * (self.okx_entry_px - okx_mid)
-        margin_okx = (abs(self.current_q_okx) * self.okx_entry_px) / self.cfg.TARGET_LEVERAGE
+        margin_okx = (_okx_ref_q * self.okx_entry_px) / self.cfg.TARGET_LEVERAGE
 
         total_pnl = pnl_hl + pnl_okx
         total_margin = margin_hl + margin_okx
         total_notional = (self.current_q_hl * hl_mid) + (abs(self.current_q_okx) * okx_mid)
         _hn = abs(self.current_q_hl) * hl_mid; _on = abs(self.current_q_okx) * okx_mid
-        if min(_hn, _on) < self.cfg.MIN_ORDER_USD * 2.0 and max(_hn, _on) > self.cfg.MIN_ORDER_USD:
-            logger.warning(f"⚡ [residue] HL ${_hn:.2f} / OKX ${_on:.2f} -> market double-flatten")
+        # [2026-11-12] 残量判据修复: 旧阈值 MIN_ORDER_USD*2.0 (=$23) 会把本账户正常的
+        # $15.6 仓位误判为残量 → 每笔开仓后 35 秒内被自己强平 (11-12 上午 9 开 8 平, 净亏 0.199U)。
+        # 正确判据是「该腿名义连最小单都下不出去」: < MIN_ORDER_USD ($11.5) 才算残量,
+        # 且要求另一腿确实还有实质仓位(否则两腿都是零头, 交给正常平仓流程处理)。
+        if (min(_hn, _on) < self.cfg.MIN_ORDER_USD
+                and max(_hn, _on) >= self.cfg.MIN_ORDER_USD):
+            logger.warning(f"⚡ [residue] HL ${_hn:.2f} / OKX ${_on:.2f} < 最小额 ${self.cfg.MIN_ORDER_USD:.1f} "
+                           f"-> market double-flatten")
             self._close_hl_market_force(abs(self.current_q_hl))
             try:
                 self.okx.place_order(inst_id=self.cfg.OKX_INST_ID, td_mode="cross", side="buy",
@@ -1212,36 +1562,81 @@ class AtomicDualLegEngineV4:
         if total_margin > 0.0:
             roi_on_margin = (total_pnl / total_margin) * 100.0
             _cross = self._compute_live_crossing(hl_mid, okx_mid)
-            _dyn = max(_cross * 2.5 / 10.0, 8.0)
-            self._last_roi_comp = dict(cross_bps=_cross, target=_dyn, roi=roi_on_margin, pnl=total_pnl)
-            if tick % 30 == 0:
-                logger.info(f"📐 [动态ROI] crossing={_cross:.1f}bps threshold={_dyn:.1f}% now={roi_on_margin:.1f}% pnl=${total_pnl:.2f}")
-            if roi_on_margin >= max(self.cfg.TARGET_NET_ROI_PCT, _dyn):
-                reason = f"双腿保证金净收益率达标 (+{roi_on_margin:.2f}% >= {self.cfg.TARGET_NET_ROI_PCT}%, 净浮盈: +${total_pnl:.2f} USD)"
+            # [2026-11-11] 原实现 _dyn = max(cross*2.5/10, 8.0)：cross 只有 1~3bps，
+            # 结果 dynamic 恒等于常数 8.0，等于没有动态。改为按点差自身的 1h 波动自适应。
+            # [2026-11-12] ROI 目标改为「跟随本次进场偏离」, 保证在低波动 regime 下可达。
+            # 原实现 max(TARGET_NET_ROI_PCT=3.0, sigma动态) 在 POST 段(捕获上限仅 ~21bps)
+            # 永远达不到 3.0% -> 只能被 4h 时间止损砍, 期望值转负。
+            # [2026-11-14] ROI 目标改为纯「进场偏离 - 摩擦」可达口径, 夹到 [ROI_MIN_PCT, ROI_MAX_PCT]。
+            # 旧实现额外取 max(1.5%, sigma地板) —— sigma 地板恒 >= 1.5%, 而当前 regime 的可达
+            # 净捕获只有 (16-18) bps ≈ 0% -> 目标永不可达 -> 每笔都只能被 4h 时间止损砍, 期望转负。
+            _target = self.entry_roi_target_pct()
+            self._last_roi_comp = dict(cross_bps=_cross, target=_target, roi=roi_on_margin, pnl=total_pnl)
+            if time.time() - self._roi_log_ts > 30.0:      # 原写 tick % 30，tick 是 run() 的局部变量 → NameError
+                self._roi_log_ts = time.time()
+                logger.info(f"📐 [动态ROI] 摩擦={_cross:.1f}bps 1h_sigma={self._spread_sigma_1h():.0f}bps "
+                            f"目标={_target:.1f}% ({_target / 0.05:.0f}bps) 当前={roi_on_margin:.1f}% pnl=${total_pnl:.2f}")
+            if roi_on_margin >= _target:
+                reason = f"双腿保证金净收益率达标 (+{roi_on_margin:.2f}% >= {_target:.2f}%, 净浮盈: +${total_pnl:.2f} USD)"
                 logger.info(f"🎯 [触发综合净利润止盈] {reason}！立即双平落袋为安！")
                 self.execute_atomic_close(reason=reason, forced=False)
                 return True
         return False
 
     def _parse_hl_fill(self, hl_res: Dict[str, Any]) -> Tuple[float, float]:
+        """解析 HL 成交回报，并把拒单原因记到 self._hl_last_err
+
+        取值: ""(无错) / "quota"(请求配额超限) / "min_value"(< $10 最小额) / "nomatch"(IOC 未撮合) / "other"
+        [2026-11-11] 配额与最小额错误必须让上层立刻停手，否则会把配额在重试阶梯里烧光。
+        """
+        self._hl_last_err = ""
         try:
             if hl_res.get("status") != "ok":
-                # [2026-11-09] P0 配额熔断：限频/配额错误会让平仓静默失败 → 变成裸腿
-                if "cumulative requests" in str(hl_res) or "Too Many" in str(hl_res):
+                msg = str(hl_res)
+                if "cumulative requests" in msg or "Too Many" in msg or "Too many" in msg:
                     self.quota_until = time.time() + self.cfg.QUOTA_HALT_SEC
-                    logger.critical(f"🛑 [HL 配额熔断] 命中请求上限，禁止开仓 {self.cfg.QUOTA_HALT_SEC}s: {str(hl_res)[:120]}")
+                    self._hl_last_err = "quota"
+                    logger.critical(f"🛑 [HL 配额熔断] 命中请求上限，全通道(含平仓)暂停 {self.cfg.QUOTA_HALT_SEC}s: {msg[:120]}")
+                else:
+                    self._hl_last_err = "other"
                 return 0.0, 0.0
             resp_data = hl_res.get("response", {})
             statuses = resp_data.get("data", {}).get("statuses", []) if isinstance(resp_data, dict) else []
             if not statuses:
                 return 0.0, 0.0
             st = statuses[0]
+            if "error" in st:
+                err = str(st["error"])
+                if "minimum value" in err:
+                    self._hl_last_err = "min_value"
+                elif "cumulative requests" in err or "Too many" in err:
+                    self.quota_until = time.time() + self.cfg.QUOTA_HALT_SEC
+                    self._hl_last_err = "quota"
+                elif "immediately match" in err:
+                    self._hl_last_err = "nomatch"
+                else:
+                    self._hl_last_err = "other"
+                logger.warning(f"⚠️ [HL 下单被拒/{self._hl_last_err}] {err[:140]}")
+                return 0.0, 0.0
             if "filled" in st:
                 sz = float(st["filled"].get("totalSz", 0.0))
                 px = float(st["filled"].get("avgPx", 0.0))
                 return sz, px
             return 0.0, 0.0
         except Exception:
+            return 0.0, 0.0
+
+    def _hl_flush_whole(self, q_hl: float, tag: str = "全平") -> Tuple[float, float]:
+        """整仓市价全平。HL 对「整仓全平」豁免 $10 最小额，用于残量不足一手的场景。"""
+        try:
+            res = self.hl_exchange.market_close(
+                self.cfg.HL_SYMBOL, sz=round(abs(q_hl), self.cfg.HL_SZ_DECIMALS), slippage=0.05)
+            self._mark_dirty()
+            filled, px = self._parse_hl_fill(res)
+            logger.warning(f"💥 [{tag}] 整仓市价全平: {filled:.2f}/{abs(q_hl):.2f} 股 @ ${px:.4f}")
+            return filled, px
+        except Exception as e:
+            logger.error(f"❌ [{tag}] 整仓市价全平异常: {e}")
             return 0.0, 0.0
 
     def _emergency_flatten_hl(self, sz: float, ref_px: float):
@@ -1288,6 +1683,22 @@ class AtomicDualLegEngineV4:
                 if hl_ask <= 0 or hl_bid <= 0 or okx_bid <= 0 or okx_ask <= 0:
                     time.sleep(1.0)
                     continue
+
+                # 0.5 [2026-11-12] 先更新自适应锚(必须在陈旧性守卫之前):
+                # 锚只需要价格, 不需要「新鲜」盘口。若放在守卫之后, HL 常态 6~9s 延迟会
+                # 跳过大量 tick, 600 样本永远攒不够 -> 锚永不收敛 -> 永不���仓(死锁)。
+                # [2026-11-13] 锚的样本改成【真实跨所价差】: 偏离度的基准必须与被测量同口径。
+                _hl_mid0 = (hl_bid + hl_ask) / 2.0
+                _okx_mid0 = (okx_bid + okx_ask) / 2.0
+                _implied_s_now = self.compute_implied_s(_hl_mid0, _okx_mid0)
+                # [2026-11-14] BUG FIX (口径混用): 中枢样本必须与被测量的偏离度【同口径】。
+                # 旧代码中枢用 mid 价差, 而 dev 用 bid/ask 价差再减 6bps haircut -> 两者差 ~8bps,
+                # 于是 dev 被系统性压低 8bps -> 门槛地板 15bps 实际等价 23bps -> 交易被腰斩,
+                # 且 ROI 目标 (dev-18) 少算 8bps -> 目标永不可达。
+                # 现在中枢与 dev 同为「买HL@ask + 卖OKX@bid」执行口径; 两者相减后 -6 haircut 自动抵消,
+                # 得到的正是 mid 口径的真实偏离度。
+                _spread_abs_bps = ((self.okx_per_share(okx_bid) - hl_ask) / hl_ask) * 10000.0 - 6.0
+                _anchor = self.update_anchor(_implied_s_now, _spread_abs_bps)
 
                 # 1. 行情陈旧性死区守卫 (任一边超 2.0s 判定数据无效)
                 now_t = time.time()
@@ -1364,13 +1775,23 @@ class AtomicDualLegEngineV4:
                             f"净Delta(USD): ${net_delta:+.2f} ({_pct:+.1f}% of leg) [{health}]"
                         )
 
-                # 3. 实时利差计算
+                # 3. 实时利差计算 (锚已在 0.5 步更新)
                 # 3.1 开仓利差: 买 HL (hl_ask) + 卖 OKX (okx_bid)
-                okx_equiv_bid = okx_bid * (10.0 / self.cfg.ASSUMED_SHARES_B)
+                # [2026-11-13] 用真实股数口径 (OKX每股等价 vs HL每股), 不再靠 ×10/锚 的自指推导。
+                okx_equiv_bid = self.okx_per_share(okx_bid)
+                # 跨所绝对价差 (bps): OKX 每股等价 vs HL 每股
                 open_spread_bps = ((okx_equiv_bid - hl_ask) / hl_ask) * 10000.0 - 6.0
 
+                # [2026-11-13] 记录【偏离度】序列 (价差 - 价差中枢), 不是价差本身。
+                # 门槛分位数与 ROI 波动自适应都基于偏离度 —— 与被测量的量同口径。
+                _anchor_spread_bps = self.spread_anchor_bps()
+                _dev_bps = (open_spread_bps - _anchor_spread_bps) if _anchor_spread_bps != 0.0 else 0.0
+                self._sp_hist.append((time.time(), _dev_bps))
+                if len(self._sp_hist) > 21600:          # 约 6 小时 @1s
+                    del self._sp_hist[:3600]
+
                 # 3.2 平仓反向利差: 卖 HL (hl_bid) + 买 OKX (okx_ask)
-                okx_equiv_ask = okx_ask * (10.0 / self.cfg.ASSUMED_SHARES_B)
+                okx_equiv_ask = self.okx_per_share(okx_ask)
                 close_spread_bps = ((okx_equiv_ask - hl_bid) / hl_bid) * 10000.0 + 6.0
 
                 # 3.3 隐含股本 S 与持仓盈亏平衡股本
@@ -1383,12 +1804,22 @@ class AtomicDualLegEngineV4:
                     edge_dbg = self.compute_edge_bps((hl_bid + hl_ask) / 2.0, (okx_bid + okx_ask) / 2.0)
                     logger.info(
                         f"[WS Heartbeat #{tick}] HL: ${hl_bid:.2f}/${hl_ask:.2f} | OKX: ${okx_bid:.2f}/${okx_ask:.2f} | "
-                        f"门禁利差({self.cfg.ASSUMED_SHARES_B:.1f}B口径): {open_spread_bps:+.1f}bps "
-                        f"(门槛 {self.cfg.ENTRY_SPREAD_BPS:.0f}) | "
-                        f"参照折价({self.cfg.REF_SHARES_B:.2f}B口径): {edge_dbg:+.1f}bps "
-                        f"-> {'OKX贵/多HL' if edge_dbg > 0 else 'HL贵/多OKX'}) | "
+                        f"跨所价差: {open_spread_bps:+.1f}bps | "
+                        f"偏离中枢: {_dev_bps:+.1f}bps (自适应门槛 {_gate:.0f}) | "
+                        f"方向: {'OKX贵/多HL' if edge_dbg > 0 else 'HL贵/多OKX'} | "
                         f"平仓反向利差: {close_spread_bps:+.1f} bps | "
-                        f"隐含S: {implied_s:.2f}B | 保本S: {be_s:.2f}B (差 {s_gap:+.1f}%)"
+                        f"隐含S: {implied_s:.2f}B | 价差中枢: {_anchor_spread_bps:+.1f}bps"
+                        f"(样本{len(self._spread_hist)}) | "
+                        f"保本S: {be_s:.2f}B (差 {s_gap:+.1f}%)"
+                    )
+
+                # 4.05 [2026-11-12] 锚点健康度：偏离自适应锚过大说明刚发生重定价,
+                # 或滚动中位数被污染(样本不足/极端跳变)。此时方向判断不可信, 禁止开新仓。
+                if tick % 60 == 0 and abs(self._anchor_dev_pct) > self.cfg.ANCHOR_MAX_DEV_PCT:
+                    logger.warning(
+                        f"⚠️ [锚点健康度] 隐含S {implied_s:.2f}B 偏离自适应锚 {self._anchor_s:.2f}B "
+                        f"{self._anchor_dev_pct:+.2f}% (>±{self.cfg.ANCHOR_MAX_DEV_PCT:.0f}%) → "
+                        f"疑似刚发生重定价, 暂停开仓直至锚重新收敛"
                     )
 
                 # 4.1 隐含股本 S 断路器
@@ -1417,15 +1848,19 @@ class AtomicDualLegEngineV4:
 
 
                 # 5. 状态机动作判断
-                # [2026-11-11] 时间止损: >12h ROI<5% -> 强制平
+                            # [2026-11-12] 时间止损: 持仓超时无条件强平 (作者策略: 最多拿 4 小时)
+                # 旧实现额外要求 ROI<5% 才平, 且 _hold_since 恒为 0 -> 退化成「立即强平」。
+                # [2026-11-14] 4h -> 8h (cfg.TIME_STOP_HOURS): 48h 忠实回测显示 4h 会砍掉
+                #   正在回归途中的仓位 (11-13 12:40 那笔 4h 时 ROI -0.97%, 再等 2.85h 就 +0.30%)。
+                # 现在: 开仓时记录起点, 超时一律平仓离场。
+                _held_s = getattr(self, '_hold_since', 0.0) or time.time()
                 if (self.current_q_hl > 0.05 and abs(self.current_q_okx) > 0.005
-                        and time.time() - getattr(self, '_hold_since', 0.0) > 12 * 3600):
+                        and time.time() - _held_s > self.cfg.TIME_STOP_HOURS * 3600):
                     _m = (abs(self.current_q_hl)*hl_mid+abs(self.current_q_okx)*okx_mid)/self.cfg.TARGET_LEVERAGE
                     _r = (self.current_q_hl*(hl_mid-self.hl_entry_px)+abs(self.current_q_okx)*(self.okx_entry_px-okx_mid))/_m*100 if _m>0 else 0
-                    if _r < 5.0:
-                        logger.critical(f"⏰ [时间止损] {(time.time()-self._hold_since)/3600:.1f}h ROI {_r:.1f}% < 5% 强制平")
-                        if self.execute_atomic_close(reason=f"时间止损({(time.time()-self._hold_since)/3600:.1f}h)", forced=True):
-                            self._hold_since = time.time(); time.sleep(self.cfg.COOLDOWN_AFTER_FILL_SEC); continue
+                    logger.critical(f"⏰ [时间止损] 持仓 {(time.time()-_held_s)/3600:.1f}h 超过 {self.cfg.TIME_STOP_HOURS:g}h, ROI {_r:.1f}% 强制平")
+                    if self.execute_atomic_close(reason=f"时间止损({(time.time()-_held_s)/3600:.1f}h)", forced=True):
+                        self._hold_since = 0.0; time.sleep(self.cfg.COOLDOWN_AFTER_FILL_SEC); continue
 
                 # 5.1 检查是否满足平仓条件 (持仓中且利差收窄)
                 if self.current_q_hl > 0.05 and abs(self.current_q_okx) > 0.005:
@@ -1446,7 +1881,23 @@ class AtomicDualLegEngineV4:
                 if (getattr(self, "naked_halt", False)
                         and time.time() >= getattr(self, "quota_until", 0.0)):
                     self._topup_deficient_leg(hl_mid, okx_mid)
-                if (not _halt) and open_spread_bps >= self.cfg.ENTRY_SPREAD_BPS:
+                # [2026-11-12] 锚未收敛(刚重定价)时禁止开新仓: 此时 E 的正负号取决于
+                # 锚落在重定价前还是后, 方向判断不可信, 开仓等于赌方向。
+                _anchor_ok = (self.anchor_ready()
+                              and abs(self._anchor_dev_pct) <= self.cfg.ANCHOR_MAX_DEV_PCT)
+                if (not _anchor_ok) and tick % 60 == 0:
+                    if not self.anchor_ready():
+                        _why = (f"样本 {len(self._s_hist)}/{self.cfg.ANCHOR_MIN_SAMPLES} 未攒够, "
+                                f"暂用兜底锚 {self._anchor_s:.2f}B")
+                    else:
+                        _why = (f"隐含S 偏离自适应锚 {self._anchor_dev_pct:+.2f}% "
+                                f"(阈值 ±{self.cfg.ANCHOR_MAX_DEV_PCT:.0f}%), 疑似刚发生重定价")
+                    logger.warning(f"⏸️ [锚未收敛] {_why} → 暂停开新仓直至锚重新收敛")
+                _gate = self.entry_gate_bps()
+                if (not _halt) and _anchor_ok and _dev_bps >= _gate:
+                    # [2026-11-13] 记录本次进场的偏离量与门槛, 供 ROI 目标跟随
+                    self._entry_dev_bps = _dev_bps
+                    self._entry_gate_bps = _gate
                     # [已停用 2026-11-08] 原开仓 S 上限门禁：S=15.19 放行、S>=15.20 立刻硬熔断，
                     # 等于在悬崖边开仓再被自己推下去。平仓侧熔断 IMPLIED_S_HARD_LIMIT_B 保持不变。
                     # if implied_s >= self.cfg.MAX_ENTRY_IMPLIED_S_B:
@@ -1457,8 +1908,10 @@ class AtomicDualLegEngineV4:
                     #     time.sleep(1.0)
                     #     continue
                     logger.info(
-                        f"🎯 开仓门禁满足！门禁利差({self.cfg.ASSUMED_SHARES_B:.1f}B口径) "
-                        f"{open_spread_bps:+.1f}bps >= {self.cfg.ENTRY_SPREAD_BPS:.0f}bps, 进入配平规划"
+                        f"🎯 开仓门禁满足！偏离中枢 {_dev_bps:+.1f}bps >= 自适应门槛 {_gate:.0f}bps "
+                        f"(p{self.cfg.ENTRY_GATE_PERCENTILE:.0f} of {self.cfg.ENTRY_GATE_WINDOW_SEC/3600:.0f}h, "
+                        f"地板 {self.cfg.ENTRY_SPREAD_BPS_FLOOR:.0f}bps) | "
+                        f"跨所价差 {open_spread_bps:+.1f}bps, 进入配平规划"
                     )
                     success = self.execute_atomic_trade(hl_ask, okx_bid)
                     if success:
