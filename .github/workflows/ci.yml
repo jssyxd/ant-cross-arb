@@ -63,7 +63,7 @@ jobs:
           if "sorted(v for _, v in self._s_hist)" not in src:
               bad.append("_anchor_s 量纲 bug 复发(应取 _s_hist 中位数)")
           # BUG 回归: sigma 地板已删除 (它把 ROI 目标恒钉在 1.5% -> 永不可达)
-              _code = chr(10).join(l.split("#")[0] for l in src.split(chr(10)))
+          _code = chr(10).join(l.split("#")[0] for l in src.split(chr(10)))
           if "ROI_MIN_BPS" in _code or "dynamic_roi_target_pct" in _code:
               bad.append("sigma 地板已删除, 不应再出现")
           if "self._hold_since = 0.0" not in src:
@@ -86,7 +86,7 @@ jobs:
       - name: 决策链自检 (不依赖网络)
         run: |
           python - <<'PY'
-          import importlib.util, math, random, statistics as st, sys
+          import importlib.util, math, random, statistics as st, sys, time
           from collections import deque
           spec = importlib.util.spec_from_file_location("ant", "04_preipo_cross_arb/core/ant_cross_arb_service.py")
           m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
@@ -107,7 +107,7 @@ jobs:
           if abs(n_hl-n_okx)/n_hl > E.cfg.MAX_USD_DELTA_PCT: fails.append("配平偏差超限")
           # 3) 锚: 同口径(价差)且非自指
           random.seed(11)
-          now = 1763000000.0
+          now = time.time()   # 必须用真实时间: entry_gate_bps 用 time.time() 做窗口过滤
           for i in range(7200):
               sp = -7.7 + random.gauss(0, 12)
               E._spread_hist.append((now-7200+i, sp)); E._s_hist.append((now-7200+i, 13.06))
